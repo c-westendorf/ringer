@@ -10603,14 +10603,15 @@ def remove_ringer_hooks(settings: dict[str, Any]) -> int:
     return removed
 
 
-def install_agent(project: bool = False) -> int:
+def install_agent(project: bool = False, hooks_only: bool = False) -> int:
     root = claude_root(project)
     skill_source = ringer_skill_source()
     skill_target = root / "skills" / "ringer" / "SKILL.md"
-    if not skill_source.exists():
-        raise ValueError(f"ringer skill source not found: {skill_source}")
-    skill_target.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(skill_source, skill_target)
+    if not hooks_only:
+        if not skill_source.exists():
+            raise ValueError(f"ringer skill source not found: {skill_source}")
+        skill_target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(skill_source, skill_target)
 
     settings_path = root / "settings.json"
     settings = load_settings(settings_path)
@@ -10632,7 +10633,15 @@ def install_agent(project: bool = False) -> int:
 
     scope = "project" if project else "user"
     print(f"Installed ringer agent for {scope} scope.")
-    print(f"Skill: {skill_target}")
+    if hooks_only:
+        print("Skill: not installed (--hooks-only; install the ringer skill per project)")
+        if skill_target.parent.exists():
+            print(
+                f"Note: {skill_target.parent} exists from an earlier install; "
+                "remove it with uninstall-agent if you install the skill per project."
+            )
+    else:
+        print(f"Skill: {skill_target}")
     if changed:
         print(f"Hooks: added PreToolUse Bash and PostToolUse Edit|Write in {settings_path}")
     else:
@@ -10640,7 +10649,7 @@ def install_agent(project: bool = False) -> int:
     return 0
 
 
-def uninstall_agent(project: bool = False) -> int:
+def uninstall_agent(project: bool = False, hooks_only: bool = False) -> int:
     root = claude_root(project)
     settings_path = root / "settings.json"
     removed_hooks = 0
@@ -10652,14 +10661,17 @@ def uninstall_agent(project: bool = False) -> int:
 
     skill_dir = root / "skills" / "ringer"
     removed_skill = False
-    if skill_dir.exists():
+    if skill_dir.exists() and not hooks_only:
         shutil.rmtree(skill_dir)
         removed_skill = True
 
     scope = "project" if project else "user"
     print(f"Uninstalled ringer agent for {scope} scope.")
     print(f"Hooks removed: {removed_hooks}")
-    print(f"Skill removed: {'yes' if removed_skill else 'no'}")
+    if hooks_only:
+        print("Skill removed: no (--hooks-only)")
+    else:
+        print(f"Skill removed: {'yes' if removed_skill else 'no'}")
     return 0
 
 
@@ -11147,9 +11159,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     install_parser = subparsers.add_parser("install-agent", help="install the ringer Claude Code skill and hooks")
     install_parser.add_argument("--project", action="store_true", help="install into ./.claude instead of ~/.claude")
+    install_parser.add_argument("--hooks-only", action="store_true", help="register the hooks but do not copy the skill (for per-project skill installs)")
 
     uninstall_parser = subparsers.add_parser("uninstall-agent", help="remove the ringer Claude Code skill and hooks")
     uninstall_parser.add_argument("--project", action="store_true", help="remove from ./.claude instead of ~/.claude")
+    uninstall_parser.add_argument("--hooks-only", action="store_true", help="remove the hooks but leave any installed skill in place")
     return parser
 
 
@@ -11195,9 +11209,9 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Self-update skipped: {result.reason or 'not available'}.")
             return 0
         if args.command == "install-agent":
-            return install_agent(project=args.project)
+            return install_agent(project=args.project, hooks_only=args.hooks_only)
         if args.command == "uninstall-agent":
-            return uninstall_agent(project=args.project)
+            return uninstall_agent(project=args.project, hooks_only=args.hooks_only)
 
         if args.command == "lint":
             manifest = Manifest.from_path(args.manifest)

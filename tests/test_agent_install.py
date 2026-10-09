@@ -171,6 +171,37 @@ class AgentInstallTests(unittest.TestCase):
         settings = self.read_settings(project)
         self.assertEqual([], self.ringer_handlers(settings))
 
+    def test_hooks_only_install_registers_hooks_without_skill(self) -> None:
+        result = self.run_cli("install-agent", "--hooks-only")
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn("not installed", result.stdout)
+        self.assertEqual(2, len(self.ringer_handlers(self.read_settings())))
+        self.assertFalse((self.home / ".claude" / "skills" / "ringer").exists())
+
+    def test_hooks_only_install_is_idempotent_and_leaves_existing_skill(self) -> None:
+        skill = self.home / ".claude" / "skills" / "ringer" / "SKILL.md"
+        skill.parent.mkdir(parents=True)
+        skill.write_text("custom skill", encoding="utf-8")
+
+        first = self.run_cli("install-agent", "--hooks-only")
+        self.assertEqual(0, first.returncode, first.stderr)
+        self.assertIn("exists from an earlier install", first.stdout)
+        second = self.run_cli("install-agent", "--hooks-only")
+        self.assertEqual(0, second.returncode, second.stderr)
+
+        self.assertEqual(2, len(self.ringer_handlers(self.read_settings())))
+        self.assertEqual("custom skill", skill.read_text(encoding="utf-8"))
+
+    def test_hooks_only_uninstall_keeps_skill_dir(self) -> None:
+        install = self.run_cli("install-agent")
+        self.assertEqual(0, install.returncode, install.stderr)
+
+        uninstall = self.run_cli("uninstall-agent", "--hooks-only")
+        self.assertEqual(0, uninstall.returncode, uninstall.stderr)
+        self.assertIn("Skill removed: no (--hooks-only)", uninstall.stdout)
+        self.assertEqual([], self.ringer_handlers(self.read_settings()))
+        self.assertTrue((self.home / ".claude" / "skills" / "ringer" / "SKILL.md").exists())
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

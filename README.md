@@ -185,6 +185,8 @@ Run one command:
 
 It installs the ringer skill — the orchestrator playbook — user-level for Claude Code, and registers two gentle hooks: a Bash hook that notices model-calling or harness commands running outside a live Ringer run, and an edit-loop hook that notices batch editing without a run. Each hook nudges ONCE per session, pointing the agent at the skill.
 
+If you install the ringer skill per project (for example from a package manifest), run `./ringer.py install-agent --hooks-only` to register just the hooks user-wide without copying the skill; `uninstall-agent --hooks-only` removes only the hooks. Both combine with `--project`.
+
 The hooks never block anything. A user who says "just do it inline" is obeyed; uninstall with `./ringer.py uninstall-agent`.
 
 For CI and evals, `config.sample.toml` includes `[engines.mock]` so the enforcement stack can be tested without an API bill.

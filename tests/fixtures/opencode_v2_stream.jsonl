@@ -1,0 +1,9 @@
+{"type":"session_start","timestamp":1792255307000,"sessionID":"ses_x"}
+{"type":"step_finish","timestamp":1792255307371,"sessionID":"ses_x","part":{"type":"step-finish","reason":"tool-calls","cost":0,"tokens":{"input":601,"output":65,"reasoning":0,"cache":{"read":9558,"write":0}}}}
+{"type":"step_finish","timestamp":1792255307800,"sessionID":"ses_x","part":{"type":"step-finish","reason":"tool-calls","cost":0,"tokens":{"input":120,"output":40,"reasoning":10,"cache":{"read":3000,"write":500}}}}
+{"type":"step_finish","timestamp":1792255308100,"sessionID":"ses_x","part":{"type":"step-finish","reason":"stop","cost":0,"tokens":{"input":7,"output":3,"reasoning":2,"cache":{"read":99,"write":1}}}}
+{"type":"step_finish","timestamp":1792255308200,"sessionID":"ses_x","part":{"type":"step-finish","reason":"stop","cost":0,"tokens":{"input":50,"output":5}}}
+this line is not json and should be skipped
+{"type":"step_finish","timestamp":1792255308300,"sessionID":"ses_x","part":{"type":"step-finish","reason":"stop","cost":0}}
+{"type":"step_finish","timestamp":1792255308400,"sessionID":"ses_x","not_part":"tokens missing entirely"}
+{"type":"run_finish","timestamp":1792255308500,"sessionID":"ses_x"}

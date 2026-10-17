@@ -37,6 +37,30 @@ reuse_open_tab = true
 # For one command, pass --no-self-update. To disable automatic checks in an
 # environment or service, set RINGER_NO_SELF_UPDATE=1.
 
+# Local models served by Ollama run on one shared machine GPU, so too many
+# concurrent local tasks slow every cell and hit worker timeouts. This cap is
+# separate from max_parallel (the run-wide asyncio.Semaphore): OpenRouter and
+# Codex tasks keep running at max_parallel, while tasks whose model slug
+# starts with one of `prefixes` are held to `max_concurrent` at a time.
+# Ollama also batches requests per model up to OLLAMA_NUM_PARALLEL, so the
+# safe value is usually <= that, not max_parallel. A manifest may override the
+# cap per-run with "max_local_parallel" (int >= 1).
+# A slug containing "cloud" (e.g. ollama/x:480b-cloud) runs on Ollama Cloud and
+# is NOT local, so it does not take a local slot.
+# `base_url` is the local model server's HTTP root (Ollama's default
+# http://127.0.0.1:11434). Before any worker spawns, Ringer preflights every
+# distinct local model: GET {base_url}/api/tags (is the server up?), the
+# model is in the tag list (run `ollama pull <name>`), and POST
+# {base_url}/api/show reports `num_ctx` >= `min_context` (opencode tool calls
+# break with a smaller context — fix it with a Modelfile that sets
+# `PARAMETER num_ctx 65536`). Local models are priced at $0.00 on the
+# scoreboard since they are not in the OpenRouter catalog.
+# [local_models]
+# prefixes = ["ollama/"]
+# max_concurrent = 1
+# base_url = "http://127.0.0.1:11434"
+# min_context = 32768
+
 # Optional model steering. The directory must contain profiles/ with one
 # Markdown profile per model. Ringer creates observations/ringer/ beneath this
 # directory automatically as attempts finish.
@@ -173,7 +197,10 @@ model_report_regex = "(?m)^model:[ \\t]*([^ \\t\\r\\n]+)[ \\t]*\\r?$"
 # ]
 # sandbox_args = []
 # full_access_args = ["--no-sandbox"]
-# token_regex = '"tokens":\{"total":([0-9]+)'
+# opencode v2 `run --format json` emits one step_finish JSON line per step with
+# per-step token counts instead of a single "tokens used: N" line, so use the
+# structured token_parser instead of a token_regex.
+# token_parser = "opencode-json"
 
 [artifact]
 # Zero-LLM, self-contained HTML artifacts rendered directly from state — no model calls, no

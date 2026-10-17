@@ -28,6 +28,7 @@ if ! OPENCODE_BIN="$(command -v opencode)" || [ -z "$OPENCODE_BIN" ]; then
 fi
 
 if [ "$SANDBOX" = "0" ]; then
+  cd "$TASKDIR"
   exec "$OPENCODE_BIN" "$@" < /dev/null
 fi
 
@@ -81,7 +82,7 @@ set +e
   -D "OC_SHARE=$HOME/.local/share/opencode" \
   -D "OC_STATE=$HOME/.local/state/opencode" \
   -D "OC_CONFIG=$HOME/.config/opencode" \
-  -f "$PROFILE" "$OPENCODE_BIN" "$@" < /dev/null
+  -f "$PROFILE" /bin/bash -c 'cd "$1" && shift && exec "$@"' -- "$TASKDIR_REAL" "$OPENCODE_BIN" "$@" < /dev/null
 status=$?
 set -e
 exit "$status"

@@ -828,6 +828,21 @@ class UpdateConfig:
 
 
 @dataclass(frozen=True)
+class LocalModelsConfig:
+    """Concurrency cap for tasks whose model slug runs on a local shared
+    GPU (e.g. Ollama). One machine serves every `ollama/` model, so too many
+    concurrent local tasks slow every cell and hit timeouts; Ollama also
+    batches requests per model up to `OLLAMA_NUM_PARALLEL`, so the safe cap is
+    lower than the run-wide `max_parallel`. Local tasks hold both the run
+    semaphore and a local semaphore; non-local tasks (OpenRouter/Codex) hold
+    only the run semaphore, so a slow local lane never starves cloud traffic.
+    """
+
+    prefixes: tuple[str, ...] = ("ollama/",)
+    max_concurrent: int = 1
+
+
+@dataclass(frozen=True)
 class SelfUpdateResult:
     status: str
     behind: int = 0
@@ -1085,6 +1100,7 @@ class AppConfig:
     artifact: ArtifactConfig
     steering: SteeringConfig = field(default_factory=SteeringConfig)
     update: UpdateConfig = field(default_factory=UpdateConfig)
+    local_models: LocalModelsConfig = field(default_factory=LocalModelsConfig)
     engine_bin_diagnostics: tuple[EngineBinDiagnostic, ...] = ()
     reuse_open_tab: bool = True
 
@@ -1120,6 +1136,7 @@ class AppConfig:
         )
         artifact_config = load_artifact_config(data.get("artifact"), state_dir)
         update_config = load_update_config(data.get("update"))
+        local_models_config = load_local_models_config(data.get("local_models"))
         try:
             steering_config = load_steering_config(data.get("steering"))
         except Exception:
@@ -1140,6 +1157,7 @@ class AppConfig:
             artifact=artifact_config,
             steering=steering_config,
             update=update_config,
+            local_models=local_models_config,
             engine_bin_diagnostics=engine_bin_diagnostics,
         )
 
@@ -1170,6 +1188,29 @@ def load_update_config(raw: Any) -> UpdateConfig:
     if interval <= 0:
         raise ValueError("update.check_interval_s must be positive")
     return UpdateConfig(auto=bool(raw.get("auto", True)), check_interval_s=interval)
+
+
+def load_local_models_config(raw: Any) -> LocalModelsConfig:
+    if raw is None:
+        return LocalModelsConfig()
+    if not isinstance(raw, dict):
+        raise ValueError("local_models must be a TOML table")
+    defaults = LocalModelsConfig()
+    raw_prefixes = raw.get("prefixes", list(defaults.prefixes))
+    if not isinstance(raw_prefixes, list) or not all(
+        isinstance(item, str) and item.strip() for item in raw_prefixes
+    ):
+        raise ValueError("local_models.prefixes must be a list of non-empty strings")
+    prefixes = tuple(str(item).strip() for item in raw_prefixes)
+    raw_max_concurrent = raw.get("max_concurrent", defaults.max_concurrent)
+    if isinstance(raw_max_concurrent, bool) or not isinstance(raw_max_concurrent, int):
+        raise ValueError(
+            "local_models.max_concurrent must be an integer, "
+            f"got {type(raw_max_concurrent).__name__}"
+        )
+    if raw_max_concurrent < 1:
+        raise ValueError("local_models.max_concurrent must be >= 1")
+    return LocalModelsConfig(prefixes=prefixes, max_concurrent=raw_max_concurrent)
 
 
 def self_update_state_path(state_dir: Path) -> Path:
@@ -1528,6 +1569,25 @@ def optional_string(value: Any) -> str | None:
     return text or None
 
 
+def _parse_manifest_optional_positive_int(value: Any, field: str) -> int | None:
+    """Strict parse for an optional manifest int field (e.g. max_local_parallel).
+
+    None means absent. bool is rejected (bool is an int subclass in Python;
+    accepting it would let `true`/`false` silently coerce). Mirrors the strict
+    check used for per-task ``max_attempts``: ``1.5`` truncating to ``1`` or a
+    string landing here is never what the manifest author meant.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(
+            f"{field} must be an integer, got {type(value).__name__}"
+        )
+    if value < 1:
+        raise ValueError(f"{field} must be >= 1")
+    return value
+
+
 def as_string_tuple(value: Any, *, key: str) -> tuple[str, ...]:
     if value is None:
         return ()
@@ -1855,6 +1915,9 @@ class Manifest:
     repo: Path | None
     tasks: tuple[TaskSpec, ...]
     source_path: Path | None = None
+    # Optional per-run override of the local-models concurrency cap
+    # ([local_models].max_concurrent). None means "use the config default".
+    max_local_parallel: int | None = None
 
     @classmethod
     def from_path(cls, path: Path) -> "Manifest":
@@ -1870,6 +1933,7 @@ class Manifest:
             repo=manifest.repo,
             tasks=manifest.tasks,
             source_path=path,
+            max_local_parallel=manifest.max_local_parallel,
         )
 
     @classmethod
@@ -1886,6 +1950,9 @@ class Manifest:
         max_parallel = int(obj.get("max_parallel", 1))
         if max_parallel <= 0:
             raise ValueError("max_parallel must be positive")
+        max_local_parallel = _parse_manifest_optional_positive_int(
+            obj.get("max_local_parallel"), "max_local_parallel"
+        )
         repo_raw = obj.get("repo")
         repo = Path(str(repo_raw)).expanduser().resolve() if repo_raw else None
         tasks_raw = obj.get("tasks")
@@ -1916,6 +1983,7 @@ class Manifest:
             worktrees=worktrees,
             repo=repo,
             tasks=tasks,
+            max_local_parallel=max_local_parallel,
         )
 
     def with_max_parallel(self, value: int | None) -> "Manifest":
@@ -1931,6 +1999,7 @@ class Manifest:
             repo=self.repo,
             tasks=self.tasks,
             source_path=self.source_path,
+            max_local_parallel=self.max_local_parallel,
         )
 
 
@@ -2320,6 +2389,7 @@ class StateWriter:
         runtimes: list[TaskRuntime],
         lock: threading.RLock,
         max_parallel: int = 1,
+        max_local_parallel: int | None = None,
         artifact: ArtifactConfig | None = None,
         path: Path | None = None,
     ) -> None:
@@ -2331,6 +2401,9 @@ class StateWriter:
         self.runtimes = runtimes
         self.lock = lock
         self.max_parallel = max_parallel
+        # Effective local-models cap the run actually used (manifest override
+        # or [local_models].max_concurrent). None means no local cap applies.
+        self.max_local_parallel = max_local_parallel
         self.state_dir = state_dir
         self.path = path or (state_dir / "runs" / f"{run_id}.json")
         self.pid = os.getpid()
@@ -2475,6 +2548,7 @@ class StateWriter:
                 "port": self.port,
                 "dashboard_port": self.port,
                 "max_parallel": self.max_parallel,
+                "max_local_parallel": self.max_local_parallel,
                 "finished": self.finished,
                 "summary": self.summary if self.finished else None,
                 "started_at": self.started_at.isoformat(),
@@ -8857,6 +8931,26 @@ class RingerRunner:
         self.started_at = datetime.now(timezone.utc)
         self.lock = threading.RLock()
         self.runtimes = [self._task_runtime(task) for task in manifest.tasks]
+        self.local_prefixes: tuple[str, ...] = config.local_models.prefixes
+        # The manifest override wins over the config default; absent means the
+        # config cap applies. Recorded in state JSON so a reader sees the limit
+        # the run actually used.
+        self.max_local_parallel: int = (
+            manifest.max_local_parallel
+            if manifest.max_local_parallel is not None
+            else config.local_models.max_concurrent
+        )
+        self.semaphore = asyncio.Semaphore(manifest.max_parallel)
+        # Local models (e.g. Ollama) share one machine's GPU, so they get a
+        # second, separate cap on top of the run-wide semaphore. A local task
+        # takes the local semaphore first, then the run semaphore; a non-local
+        # task takes only the run semaphore, so a blocked local task can never
+        # starve OpenRouter/Codex traffic waiting for a run slot.
+        self.local_semaphore: asyncio.Semaphore | None = (
+            asyncio.Semaphore(self.max_local_parallel)
+            if self.local_prefixes
+            else None
+        )
         self.state_writer = StateWriter(
             self.run_id,
             manifest.run_name,
@@ -8867,6 +8961,7 @@ class RingerRunner:
             self.runtimes,
             self.lock,
             max_parallel=manifest.max_parallel,
+            max_local_parallel=self.max_local_parallel,
             artifact=config.artifact,
         )
         self.dashboard = (
@@ -8881,7 +8976,6 @@ class RingerRunner:
         )
         self.logger = EvalLogger(config.eval)
         self.verifier = Verifier()
-        self.semaphore = asyncio.Semaphore(manifest.max_parallel)
         self.active_processes: dict[int, asyncio.subprocess.Process] = {}
 
     async def run(self) -> int:
@@ -8934,55 +9028,90 @@ class RingerRunner:
                 kill_process_group(proc)
 
     async def _run_task(self, runtime: TaskRuntime) -> None:
-        async with self.semaphore:
+        local_sem = self._local_semaphore_for(runtime)
+        # Local tasks hold both the run semaphore and the local semaphore.
+        # Take the local one first, then the run semaphore, so a local task
+        # waiting on a run slot never blocks a non-local task that only needs
+        # the run semaphore. Non-local tasks take only the run semaphore.
+        if local_sem is not None:
+            await local_sem.acquire()
+        try:
+            async with self.semaphore:
+                await self._run_task_body(runtime)
+        finally:
+            if local_sem is not None:
+                local_sem.release()
+
+    async def _run_task_body(self, runtime: TaskRuntime) -> None:
+        with self.lock:
+            runtime.started_at_monotonic = time.monotonic()
+        prepared, prepare_error = await self._prepare_taskdir(runtime)
+        if not prepared:
+            await self._record_prepare_error(runtime, prepare_error or "taskdir preparation failed")
+            return
+        current_spec = runtime.task.spec
+        max_attempts = runtime.task.max_attempts
+        for attempt in range(1, max_attempts + 1):
+            retrying = attempt > 1
             with self.lock:
-                runtime.started_at_monotonic = time.monotonic()
-            prepared, prepare_error = await self._prepare_taskdir(runtime)
-            if not prepared:
-                await self._record_prepare_error(runtime, prepare_error or "taskdir preparation failed")
-                return
-            current_spec = runtime.task.spec
-            max_attempts = runtime.task.max_attempts
-            for attempt in range(1, max_attempts + 1):
-                retrying = attempt > 1
+                runtime.attempts = attempt
+                runtime.status = "retrying" if retrying else "running"
+            attempt_started = time.monotonic()
+            worker = await self._run_worker(runtime, current_spec, attempt)
+            with self.lock:
+                runtime.worker_pid = None
+                runtime.status = "verifying"
+                if worker.tokens is not None:
+                    runtime.tokens = (runtime.tokens or 0) + worker.tokens
+            verify = await self.verifier.verify(runtime.task, runtime.taskdir)
+            verdict = verdict_for(worker, verify)
+            with self.lock:
+                runtime.last_check_returncode = verify.check_returncode
+                runtime.last_check_timed_out = verify.check_timed_out
+                runtime.last_check_output = verify.raw_output_excerpt
+            duration_ms = int((time.monotonic() - attempt_started) * 1000)
+            self._log_attempt(runtime, current_spec, retrying, worker, verify, verdict, duration_ms)
+            if verdict == "PASS":
+                self._harvest_deliverables_on_pass(runtime)
                 with self.lock:
-                    runtime.attempts = attempt
-                    runtime.status = "retrying" if retrying else "running"
-                attempt_started = time.monotonic()
-                worker = await self._run_worker(runtime, current_spec, attempt)
-                with self.lock:
-                    runtime.worker_pid = None
-                    runtime.status = "verifying"
-                    if worker.tokens is not None:
-                        runtime.tokens = (runtime.tokens or 0) + worker.tokens
-                verify = await self.verifier.verify(runtime.task, runtime.taskdir)
-                verdict = verdict_for(worker, verify)
-                with self.lock:
-                    runtime.last_check_returncode = verify.check_returncode
-                    runtime.last_check_timed_out = verify.check_timed_out
-                    runtime.last_check_output = verify.raw_output_excerpt
-                duration_ms = int((time.monotonic() - attempt_started) * 1000)
-                self._log_attempt(runtime, current_spec, retrying, worker, verify, verdict, duration_ms)
-                if verdict == "PASS":
-                    self._harvest_deliverables_on_pass(runtime)
-                    with self.lock:
-                        runtime.status = "pass"
-                        runtime.final_verdict = verdict
-                        runtime.ended_at_monotonic = time.monotonic()
-                    await self._cleanup_worktree_on_pass(runtime)
-                    return
-                if attempt < max_attempts and verdict in {"FAIL", "TIMEOUT"}:
-                    failure_context = build_failure_context(runtime.log_path, verify.raw_output_excerpt)
-                    current_spec = (
-                        f"{runtime.task.spec}\n\n"
-                        f"Previous attempt failed: {failure_context}. Fix it."
-                    )
-                    continue
-                with self.lock:
-                    runtime.status = "fail"
+                    runtime.status = "pass"
                     runtime.final_verdict = verdict
                     runtime.ended_at_monotonic = time.monotonic()
+                await self._cleanup_worktree_on_pass(runtime)
                 return
+            if attempt < max_attempts and verdict in {"FAIL", "TIMEOUT"}:
+                failure_context = build_failure_context(runtime.log_path, verify.raw_output_excerpt)
+                current_spec = (
+                    f"{runtime.task.spec}\n\n"
+                    f"Previous attempt failed: {failure_context}. Fix it."
+                )
+                continue
+            with self.lock:
+                runtime.status = "fail"
+                runtime.final_verdict = verdict
+                runtime.ended_at_monotonic = time.monotonic()
+            return
+
+    def _local_semaphore_for(self, runtime: TaskRuntime) -> asyncio.Semaphore | None:
+        """The local semaphore a task must hold, or None for non-local tasks.
+
+        A task is "local" when its effective model slug starts with a
+        configured local prefix (default ``ollama/``) — i.e. it runs on the
+        one shared local GPU. An Ollama Cloud slug (e.g.
+        ``ollama/x:480b-cloud``) contains ``cloud`` and runs remotely, so it
+        is not local and does not take a local slot. The effective model is the
+        task's declared ``model`` falling back to the engine's
+        ``model_default`` — both are known before the worker spawns.
+        """
+        if self.local_semaphore is None:
+            return None
+        engine = self.config.engines.get(runtime.task.engine)
+        model = resolved_task_model(runtime.task, engine)
+        if not model or "cloud" in model:
+            return None
+        if any(model.startswith(prefix) for prefix in self.local_prefixes):
+            return self.local_semaphore
+        return None
 
     def _harvest_deliverables_on_pass(self, runtime: TaskRuntime) -> None:
         harvested: list[dict[str, Any]] = []

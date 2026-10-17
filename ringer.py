@@ -728,6 +728,13 @@ def build_context_packet(
 # End one-request context packet selection.
 
 
+# Named token parsers for engines whose worker output is a structured stream
+# rather than a single "tokens used: N" line. Add new parsers here and wire them
+# into parse_token_count's dispatch. (Lives here, near EngineConfig, because it
+# is part of the engine-config vocabulary.)
+TOKEN_PARSERS = frozenset({"opencode-json"})
+
+
 @dataclass(frozen=True)
 class EngineConfig:
     name: str
@@ -736,6 +743,12 @@ class EngineConfig:
     full_access_args: tuple[str, ...]
     sandbox_args: tuple[str, ...]
     token_regex: str | None = DEFAULT_TOKEN_REGEX
+    # Alternative to token_regex for engines whose worker output is a stream of
+    # JSON events rather than a single "tokens used: N" line. The only supported
+    # value today is "opencode-json", which sums per-step token counts emitted by
+    # `opencode run --format json` (v2+). token_regex and token_parser are
+    # mutually exclusive — setting both is a config error (see load_engines).
+    token_parser: str | None = None
     model_report_regex: str | None = None
     # Fills the {model} placeholder in args_template when a task does not set
     # its own "model" — this is what makes a harness engine (OpenCode) model
@@ -1676,14 +1689,36 @@ def load_engines(raw: Any) -> dict[str, EngineConfig]:
             section.get("sandbox_args", list(base.sandbox_args) if base else []),
             key=f"engines.{clean_name}.sandbox_args",
         )
-        token_regex = optional_string(section.get("token_regex"))
-        if token_regex is None and base is not None:
-            token_regex = base.token_regex
-        if token_regex:
-            try:
-                re.compile(token_regex, flags=re.IGNORECASE)
-            except re.error as exc:
-                raise ValueError(f"engines.{clean_name}.token_regex is invalid: {exc}") from exc
+        token_regex_raw = section.get("token_regex")
+        token_parser_raw = section.get("token_parser")
+        # token_parser is an alternative to token_regex, not a companion. Setting
+        # both on the same engine section is a config error with a clear message.
+        if token_regex_raw is not None and token_parser_raw is not None:
+            raise ValueError(
+                f"engines.{clean_name}: set either token_regex or token_parser, "
+                f"not both"
+            )
+        token_parser = optional_string(token_parser_raw)
+        if token_parser is None and base is not None:
+            token_parser = base.token_parser
+        if token_parser:
+            if token_parser not in TOKEN_PARSERS:
+                raise ValueError(
+                    f"engines.{clean_name}.token_parser must be one of "
+                    f"{sorted(TOKEN_PARSERS)!r}, got {token_parser!r}"
+                )
+            # When a parser is set, never also carry a regex (covers inheritance
+            # from a base engine that had one).
+            token_regex = None
+        else:
+            token_regex = optional_string(token_regex_raw)
+            if token_regex is None and base is not None:
+                token_regex = base.token_regex
+            if token_regex:
+                try:
+                    re.compile(token_regex, flags=re.IGNORECASE)
+                except re.error as exc:
+                    raise ValueError(f"engines.{clean_name}.token_regex is invalid: {exc}") from exc
         model_report_regex = optional_string(section.get("model_report_regex"))
         if model_report_regex is None and base is not None:
             model_report_regex = base.model_report_regex
@@ -1708,6 +1743,7 @@ def load_engines(raw: Any) -> dict[str, EngineConfig]:
             full_access_args=full_access_args,
             sandbox_args=sandbox_args,
             token_regex=token_regex,
+            token_parser=token_parser,
             model_report_regex=model_report_regex,
             model_default=model_default,
         )
@@ -9259,7 +9295,7 @@ class RingerRunner:
                     await reader
             self.active_processes.pop(proc.pid, None)
         output_tail = capture.text()
-        tokens = parse_token_count(output_tail, engine.token_regex)
+        tokens = parse_token_count(output_tail, engine.token_regex, engine.token_parser)
         reported_model = parse_reported_model(output_tail, engine.model_report_regex)
         if timed_out:
             append_text(log_path, f"\n[ringer.py] worker timed out after {runtime.task.timeout_s}s\n")
@@ -9562,7 +9598,73 @@ def parse_env_file(path: Path) -> dict[str, str]:
     return values
 
 
-def parse_token_count(text: str, token_regex: str | None = DEFAULT_TOKEN_REGEX) -> int | None:
+def _as_int_tokens(value: Any) -> int:
+    """Coerce a token-count field to a non-negative int. Non-numbers count as 0."""
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, (int, float)):
+        return max(0, int(value))
+    return 0
+
+
+def parse_opencode_json_tokens(text: str) -> int | None:
+    """Sum per-step token counts from an `opencode run --format json` stream.
+
+    opencode v2 emits one JSON object per line; the token count lives on each
+    `step_finish` event as ``part.tokens.{input,output,reasoning,cache.{read,write}}``.
+    The task total is the sum over every top-level ``type == "step_finish"`` line
+    of ``input + output + reasoning + cache.write``. ``cache.read`` is excluded
+    (cached prompt tokens are re-reads, not new work).
+
+    Lines that are not valid JSON are skipped. A ``step_finish`` line that is
+    missing a field contributes 0 for that field (it still counts as a step).
+    No ``step_finish`` lines returns ``None``.
+
+    NOTE: ringer captures worker output through a 1 MB rolling buffer
+    (``RollingBytes(max_bytes=1_000_000)``). For runs whose combined output
+    exceeds that cap, earlier ``step_finish`` lines may have aged out of the
+    buffer before parsing, so this sum can undercount long runs. We parse what
+    is kept; widening the capture is out of scope for the token parser.
+    """
+    total = 0
+    found = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or not stripped.startswith("{"):
+            continue
+        try:
+            obj = json.loads(stripped)
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(obj, dict) or obj.get("type") != "step_finish":
+            continue
+        found = True
+        part = obj.get("part")
+        if not isinstance(part, dict):
+            continue
+        tokens = part.get("tokens")
+        if not isinstance(tokens, dict):
+            continue
+        cache = tokens.get("cache")
+        total += (
+            _as_int_tokens(tokens.get("input"))
+            + _as_int_tokens(tokens.get("output"))
+            + _as_int_tokens(tokens.get("reasoning"))
+            + _as_int_tokens(cache.get("write") if isinstance(cache, dict) else None)
+        )
+    return total if found else None
+
+
+def parse_token_count(
+    text: str,
+    token_regex: str | None = DEFAULT_TOKEN_REGEX,
+    token_parser: str | None = None,
+) -> int | None:
+    if token_parser:
+        if token_parser == "opencode-json":
+            return parse_opencode_json_tokens(text)
+        # Unknown parser names are rejected at config load; be defensive here.
+        return None
     if token_regex:
         matches = list(re.finditer(token_regex, text, flags=re.IGNORECASE))
         for match in reversed(matches):

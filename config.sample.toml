@@ -173,7 +173,10 @@ model_report_regex = "(?m)^model:[ \\t]*([^ \\t\\r\\n]+)[ \\t]*\\r?$"
 # ]
 # sandbox_args = []
 # full_access_args = ["--no-sandbox"]
-# token_regex = '"tokens":\{"total":([0-9]+)'
+# opencode v2 `run --format json` emits one step_finish JSON line per step with
+# per-step token counts instead of a single "tokens used: N" line, so use the
+# structured token_parser instead of a token_regex.
+# token_parser = "opencode-json"
 
 [artifact]
 # Zero-LLM, self-contained HTML artifacts rendered directly from state — no model calls, no

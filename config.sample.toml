@@ -47,9 +47,19 @@ reuse_open_tab = true
 # cap per-run with "max_local_parallel" (int >= 1).
 # A slug containing "cloud" (e.g. ollama/x:480b-cloud) runs on Ollama Cloud and
 # is NOT local, so it does not take a local slot.
+# `base_url` is the local model server's HTTP root (Ollama's default
+# http://127.0.0.1:11434). Before any worker spawns, Ringer preflights every
+# distinct local model: GET {base_url}/api/tags (is the server up?), the
+# model is in the tag list (run `ollama pull <name>`), and POST
+# {base_url}/api/show reports `num_ctx` >= `min_context` (opencode tool calls
+# break with a smaller context — fix it with a Modelfile that sets
+# `PARAMETER num_ctx 65536`). Local models are priced at $0.00 on the
+# scoreboard since they are not in the OpenRouter catalog.
 # [local_models]
 # prefixes = ["ollama/"]
 # max_concurrent = 1
+# base_url = "http://127.0.0.1:11434"
+# min_context = 32768
 
 # Optional model steering. The directory must contain profiles/ with one
 # Markdown profile per model. Ringer creates observations/ringer/ beneath this

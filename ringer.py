@@ -836,10 +836,21 @@ class LocalModelsConfig:
     lower than the run-wide `max_parallel`. Local tasks hold both the run
     semaphore and a local semaphore; non-local tasks (OpenRouter/Codex) hold
     only the run semaphore, so a slow local lane never starves cloud traffic.
+
+    `base_url` is the local model server's HTTP root (Ollama's default
+    `http://127.0.0.1:11434`) and `min_context` is the smallest `num_ctx` the
+    preflight will accept — opencode tool calls break with a smaller context,
+    so a too-small or missing model context is caught before any worker spawns
+    instead of surfacing as a confusing failure deep in an opencode transcript.
     """
 
     prefixes: tuple[str, ...] = ("ollama/",)
     max_concurrent: int = 1
+    # Ollama's default HTTP root on the runner's own machine.
+    base_url: str = "http://127.0.0.1:11434"
+    # Smallest `num_ctx` the preflight accepts — opencode tool calls break
+    # with a smaller context.
+    min_context: int = 32768
 
 
 @dataclass(frozen=True)
@@ -1210,7 +1221,24 @@ def load_local_models_config(raw: Any) -> LocalModelsConfig:
         )
     if raw_max_concurrent < 1:
         raise ValueError("local_models.max_concurrent must be >= 1")
-    return LocalModelsConfig(prefixes=prefixes, max_concurrent=raw_max_concurrent)
+    raw_base_url = raw.get("base_url", defaults.base_url)
+    if not isinstance(raw_base_url, str) or not raw_base_url.strip():
+        raise ValueError("local_models.base_url must be a non-empty string")
+    base_url = raw_base_url.strip()
+    raw_min_context = raw.get("min_context", defaults.min_context)
+    if isinstance(raw_min_context, bool) or not isinstance(raw_min_context, int):
+        raise ValueError(
+            "local_models.min_context must be an integer, "
+            f"got {type(raw_min_context).__name__}"
+        )
+    if raw_min_context < 1:
+        raise ValueError("local_models.min_context must be >= 1")
+    return LocalModelsConfig(
+        prefixes=prefixes,
+        max_concurrent=raw_max_concurrent,
+        base_url=base_url,
+        min_context=raw_min_context,
+    )
 
 
 def self_update_state_path(state_dir: Path) -> Path:
@@ -7815,7 +7843,34 @@ def aggregate_model_scoreboard_rows(
     return finalized
 
 
+def is_local_model_slug(
+    slug: Any,
+    *,
+    prefixes: tuple[str, ...] | None = None,
+) -> bool:
+    """True when ``slug`` runs on the local model server.
+
+    A local slug starts with one of the configured ``[local_models].prefixes``
+    (default ``ollama/``) and must not contain ``cloud`` — an Ollama Cloud
+    slug (e.g. ``ollama/x:480b-cloud``) runs remotely and is not local. The
+    cost helpers use the default prefixes because the scoreboard renders
+    without a config handle; the preflight resolves prefixes from the
+    loaded config directly.
+    """
+    text = str(slug or "").strip()
+    if not text or "cloud" in text:
+        return False
+    if prefixes is None:
+        prefixes = LocalModelsConfig().prefixes
+    return any(text.startswith(prefix) for prefix in prefixes)
+
+
 def estimated_task_cost(row: dict[str, Any], catalog_model: dict[str, Any] | None) -> float | None:
+    # Local models are not in the OpenRouter catalog and run on the runner's
+    # own GPU, so they have no per-task dollar cost — show $0.00, not
+    # "unknown", on the scoreboard.
+    if is_local_model_slug(row.get("model")):
+        return 0.0
     median_tokens = row.get("median_tokens")
     if median_tokens is None or catalog_model is None or catalog_model.get("variable_pricing"):
         return None
@@ -7926,6 +7981,8 @@ def source_file_link(path: Path, label: str) -> str:
 
 
 def model_task_cost_label(row: dict[str, Any], catalog_model: dict[str, Any] | None) -> str:
+    if is_local_model_slug(row.get("model")):
+        return "$0.00 (local)"
     median_tokens = row.get("median_tokens")
     if median_tokens is None:
         return "in plan"
@@ -9975,6 +10032,217 @@ def preflight_engine_bins(manifest: Manifest, config: AppConfig) -> None:
             )
 
 
+def _local_model_name(slug: str, prefixes: tuple[str, ...]) -> str:
+    """Strip a local prefix from ``slug`` to get the server-side model name.
+
+    ``ollama/qwen3.5-27b-64k`` → ``qwen3.5-27b-64k``. The server name is what
+    Ollama's ``/api/tags`` and ``/api/show`` endpoints expect.
+    """
+    for prefix in prefixes:
+        if slug.startswith(prefix):
+            return slug[len(prefix):]
+    return slug
+
+
+def _ollama_tag_names(tags_body: Any) -> set[str]:
+    """Model names from an Ollama ``/api/tags`` response body."""
+    if not isinstance(tags_body, dict):
+        return set()
+    models = tags_body.get("models")
+    if not isinstance(models, list):
+        return set()
+    names: set[str] = set()
+    for item in models:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("name")
+        if isinstance(name, str) and name.strip():
+            names.add(name.strip())
+    return names
+
+
+def _matches_ollama_tag(name: str, tag_names: set[str]) -> bool:
+    """True when ``name`` is served, resolving a bare name to ``:latest``.
+
+    Ollama tags always carry a ``:tag`` suffix, so a slug without one
+    (e.g. ``qwen3.5-27b-64k``) is pulled and listed as ``qwen3.5-27b-64k:latest``.
+    """
+    if name in tag_names:
+        return True
+    if ":" not in name and f"{name}:latest" in tag_names:
+        return True
+    return False
+
+
+_LOCAL_NUM_CTX_RE = re.compile(r"num_ctx\s+(\d+)")
+
+
+def _parse_num_ctx(parameters: Any) -> int | None:
+    """Parse ``num_ctx`` from an Ollama ``/api/show`` ``parameters`` text.
+
+    The ``parameters`` field is the same text ``ollama show ... --parameters``
+    prints (e.g. ``"num_ctx 65536\n..."``). Returns ``None`` when it is absent
+    or carries no ``num_ctx`` line — a model with no ``num_ctx`` falls back to
+    a small default context, which breaks opencode tool calls.
+    """
+    if not isinstance(parameters, str) or not parameters.strip():
+        return None
+    match = _LOCAL_NUM_CTX_RE.search(parameters)
+    if match is None:
+        return None
+    try:
+        return int(match.group(1))
+    except (TypeError, ValueError):
+        return None
+
+
+class _LocalFetchError(Exception):
+    """Network or parse failure from the local-model HTTP preflight."""
+
+
+def local_fetch_json(
+    method: str,
+    url: str,
+    *,
+    body: dict[str, Any] | None = None,
+    timeout: float = 5.0,
+) -> dict[str, Any]:
+    """Default urllib-based fetch for the local-model preflight.
+
+    Uses only the stdlib ``urllib`` so the harness stays dependency-free. Returns
+    the parsed JSON object; raises ``_LocalFetchError`` on any network or JSON
+    failure so the preflight can map every failure mode to one message. Tests
+    pass their own ``fetch`` to stay off the network.
+    """
+    data: bytes | None = None
+    if body is not None:
+        data = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(url, data=data, method=method)
+    req.add_header("Accept", "application/json")
+    if body is not None:
+        req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read()
+    except Exception as exc:  # urllib.error.URLError, socket.timeout, OSError, ...
+        raise _LocalFetchError(str(exc) or type(exc).__name__) from exc
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise _LocalFetchError(f"non-UTF-8 response from {url}: {exc}") from exc
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise _LocalFetchError(f"invalid JSON from {url}: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise _LocalFetchError(f"expected a JSON object from {url}")
+    return parsed
+
+
+def distinct_local_model_slugs(
+    tasks: Iterable[TaskSpec],
+    engines: dict[str, EngineConfig],
+    prefixes: tuple[str, ...],
+) -> list[str]:
+    """Distinct model slugs in ``tasks`` that run on the local server.
+
+    A slug is local when it starts with one of ``prefixes`` and does not
+    contain ``cloud`` (an Ollama Cloud slug runs remotely). The effective
+    model is the task's declared ``model`` falling back to the engine's
+    ``model_default`` — both are known before the worker spawns.
+    """
+    if not prefixes:
+        return []
+    seen: set[str] = set()
+    for task in tasks:
+        engine = engines.get(task.engine)
+        model = resolved_task_model(task, engine)
+        if not model or "cloud" in model:
+            continue
+        if any(model.startswith(prefix) for prefix in prefixes):
+            seen.add(model)
+    return sorted(seen)
+
+
+def preflight_local_models(
+    manifest: Manifest,
+    config: AppConfig,
+    *,
+    fetch: Any = local_fetch_json,
+) -> None:
+    """Fail before spawning workers if a local model server can't serve the run.
+
+    For every distinct local model slug in the manifest, check that the local
+    server (Ollama by default) is reachable, has the model pulled, and serves
+    enough context (``num_ctx`` >= ``[local_models].min_context``). A slug
+    containing ``cloud`` runs on Ollama Cloud and is not local, so it is
+    skipped. Mirrors `preflight_engine_bins`: a confusing opencode transcript
+    is the wrong place to discover a missing model or a too-small context.
+
+    ``fetch`` is injectable so tests never touch the network; the default
+    uses stdlib ``urllib`` only.
+    """
+    prefixes = config.local_models.prefixes
+    if not prefixes:
+        return
+    slugs = distinct_local_model_slugs(manifest.tasks, config.engines, prefixes)
+    if not slugs:
+        return
+    base_url = config.local_models.base_url.rstrip("/")
+    min_context = config.local_models.min_context
+    # 1. The server is reachable within 5 s.
+    try:
+        tags_body = fetch("GET", f"{base_url}/api/tags", timeout=5.0)
+    except Exception:
+        raise ValueError(
+            f"local model server not reachable at {base_url} — "
+            "start it with: ollama serve"
+        )
+    tag_names = _ollama_tag_names(tags_body)
+    for slug in slugs:
+        name = _local_model_name(slug, prefixes)
+        # 2. The model is pulled on the server.
+        if not _matches_ollama_tag(name, tag_names):
+            raise ValueError(
+                f"local model '{slug}' is not available on the server at "
+                f"{base_url} — run: ollama pull {name} "
+                "(or run the harness setup script)"
+            )
+        # 3. The model serves enough context for opencode tool calls.
+        try:
+            show_body = fetch(
+                "POST",
+                f"{base_url}/api/show",
+                body={"model": name},
+                timeout=5.0,
+            )
+        except Exception as exc:
+            raise ValueError(
+                f"local model '{slug}': could not inspect context on the "
+                f"server at {base_url} ({exc})"
+            )
+        if not isinstance(show_body, dict):
+            raise ValueError(
+                f"local model '{slug}': unexpected /api/show response from "
+                f"{base_url}"
+            )
+        num_ctx = _parse_num_ctx(show_body.get("parameters"))
+        if num_ctx is None:
+            raise ValueError(
+                f"local model '{slug}' has no num_ctx parameter on the server "
+                f"at {base_url} — opencode tool calls break with a small "
+                f"context. Fix it with a Modelfile that sets: "
+                f"PARAMETER num_ctx {min_context}"
+            )
+        if num_ctx < min_context:
+            raise ValueError(
+                f"local model '{slug}' serves num_ctx {num_ctx}, below the "
+                f"minimum {min_context} (opencode tool calls break with a "
+                f"small context). Fix it with a Modelfile that sets: "
+                f"PARAMETER num_ctx {min_context}"
+            )
+
+
 def validate_manifest_engines(manifest: Manifest, config: AppConfig) -> None:
     missing = sorted({task.engine for task in manifest.tasks if task.engine not in config.engines})
     if missing:
@@ -10681,6 +10949,7 @@ def run_one_request(config: AppConfig, args: argparse.Namespace) -> int:
     )
     validate_manifest_engines(manifest, config)
     preflight_engine_bins(manifest, config)
+    preflight_local_models(manifest, config)
     identity = resolve_identity(
         args.identity,
         config,
@@ -11502,9 +11771,12 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if getattr(args, "baseline", False):
             # Deliberately before preflight_engine_bins: baseline spawns no
-            # workers, so a missing engine binary must not block it.
+            # workers, so a missing engine binary must not block it. The
+            # local-model preflight is skipped here for the same reason: no
+            # worker ever asks the local server for a model.
             return asyncio.run(run_baseline(manifest, config=config))
         preflight_engine_bins(manifest, config)
+        preflight_local_models(manifest, config)
         if args.command == "run":
             start_catalog_auto_refresh()
         if dashboard_enabled and not args.browser:
